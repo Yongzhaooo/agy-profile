@@ -112,6 +112,7 @@ agy-profile random
 | `agy-profile next` | Switch to the **next** profile (round-robin, A-Z order) |
 | `agy-profile random` | Switch to a **random** profile other than the current one |
 | `agy-profile list` | List profiles; `*` = matches the logged-in account |
+| `agy-profile quota [name]` | Check Gemini model limits (5h & weekly) across profiles (or a specific profile) |
 | `agy-profile current` | Show the active profile; warns if the current account was never saved |
 | `agy-profile delete <name>` | Delete a saved profile (the logged-in account is not affected) |
 | `agy-profile export <name> [file]` | Export a profile to a password-protected, portable file |

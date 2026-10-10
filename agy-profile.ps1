@@ -371,6 +371,19 @@ function Invoke-Switch {
 
     if ($current) { Backup-IfUnsaved $current }
 
+    $data = Apply-ProfileFilesAndCred $TargetName
+
+    $who = if ($data.userName) { " ($($data.userName))" } else { '' }
+    Write-Host "Switched to profile '$TargetName'$who." -ForegroundColor Green
+}
+
+function Apply-ProfileFilesAndCred([string]$TargetName) {
+    $dir      = Get-ProfileDir $TargetName
+    $credFile = Join-Path $dir 'credential.dpapi'
+    if (-not (Test-Path $credFile)) {
+        throw "Profile '$TargetName' does not exist. See: agy-profile list"
+    }
+
     $data = Unprotect-FromFile $credFile
     [CredMan]::Write($CRED_TARGET, $data.userName, $data.comment, [uint32]$data.persist,
         [Convert]::FromBase64String($data.blobB64))
@@ -387,8 +400,15 @@ function Invoke-Switch {
     }
 
     Set-Content -Encoding ASCII $ACTIVE_FILE $TargetName
-    $who = if ($data.userName) { " ($($data.userName))" } else { '' }
-    Write-Host "Switched to profile '$TargetName'$who." -ForegroundColor Green
+    return $data
+}
+
+function Restore-OriginalState([string]$origName, $origCred) {
+    if ($origName -and (Test-Path (Get-ProfileDir $origName))) {
+        Apply-ProfileFilesAndCred $origName | Out-Null
+    } elseif ($origCred) {
+        [CredMan]::Write($CRED_TARGET, $origCred.UserName, $origCred.Comment, [uint32]$origCred.Persist, $origCred.Blob)
+    }
 }
 
 # Active profile name: prefer matching the real credential hash, fall back to _active.txt
@@ -450,6 +470,123 @@ function Invoke-List {
     if (-not $cred) {
         Write-Warning "Not logged in to any account (credential '$CRED_TARGET' does not exist)."
     }
+}
+
+function Format-Percent($frac) {
+    if ($null -eq $frac) { return '-' }
+    return "$([Math]::Round([double]$frac * 100))%"
+}
+
+function Format-ResetTime($timeVal) {
+    if (-not $timeVal) { return '-' }
+    try {
+        if ($timeVal -is [DateTime]) {
+            return $timeVal.ToLocalTime().ToString("MM-dd HH:mm")
+        }
+        $dt = [DateTime]::Parse($timeVal.ToString()).ToLocalTime()
+        return $dt.ToString("MM-dd HH:mm")
+    } catch {
+        return $timeVal.ToString()
+    }
+}
+
+function Get-AgyGeminiUsage {
+    $raw = & agy -p "/usage" --output-format json 2>$null | Out-String
+    if (-not $raw) { return $null }
+    $data = $raw | ConvertFrom-Json
+    if (-not $data -or -not $data.command -or -not $data.command.data) { return $null }
+    $group = $data.command.data.groups | Where-Object { $_.name -like '*Gemini*' }
+    if (-not $group) { return $null }
+
+    $res = @{
+        Limit5h     = '-'
+        Reset5h     = '-'
+        Weekly      = '-'
+        ResetWeekly = '-'
+    }
+    foreach ($bucket in $group.buckets) {
+        if ($bucket.id -eq 'gemini-5h' -or $bucket.window -eq '5h') {
+            $res.Limit5h = Format-Percent $bucket.remaining_fraction
+            $res.Reset5h = Format-ResetTime $bucket.reset_time
+        } elseif ($bucket.id -eq 'gemini-weekly' -or $bucket.window -eq 'weekly') {
+            $res.Weekly = Format-Percent $bucket.remaining_fraction
+            $res.ResetWeekly = Format-ResetTime $bucket.reset_time
+        }
+    }
+    return $res
+}
+
+function Invoke-Quota {
+    $saved = Get-SavedProfiles
+    if ($saved.Count -eq 0) {
+        Write-Host "No profiles yet. Save the current account with: agy-profile save <name>"
+        return
+    }
+
+    $targets = if ($Name) {
+        Test-ProfileName $Name
+        $matched = @($saved | Where-Object { $_.Name -eq $Name })
+        if ($matched.Count -eq 0) {
+            throw "Profile '$Name' does not exist. See: agy-profile list"
+        }
+        $matched
+    } else {
+        $saved
+    }
+
+    $origActive = Get-ActiveProfileName
+    $origCred   = Get-CurrentCred
+
+    $targetDesc = if ($Name) { "profile '$Name'" } else { "$($targets.Count) profiles" }
+    Write-Host "Checking Gemini quota across $targetDesc..." -ForegroundColor Cyan
+
+    $rows = @()
+    try {
+        foreach ($p in $targets) {
+            Write-Host "  Querying '$($p.Name)'..." -NoNewline
+            $isCur = ($origActive -and $p.Name -eq $origActive)
+            try {
+                Apply-ProfileFilesAndCred $p.Name | Out-Null
+                $usage = Get-AgyGeminiUsage
+                if ($usage) {
+                    Write-Host " Done." -ForegroundColor Green
+                    $rows += [PSCustomObject]@{
+                        Active         = if ($isCur) { '*' } else { ' ' }
+                        Profile        = $p.Name
+                        '5h Limit'     = $usage.Limit5h
+                        '5h Reset'     = $usage.Reset5h
+                        'Weekly Limit' = $usage.Weekly
+                        'Weekly Reset' = $usage.ResetWeekly
+                    }
+                } else {
+                    Write-Host " Failed (no usage data)." -ForegroundColor Yellow
+                    $rows += [PSCustomObject]@{
+                        Active         = if ($isCur) { '*' } else { ' ' }
+                        Profile        = $p.Name
+                        '5h Limit'     = 'N/A'
+                        '5h Reset'     = '-'
+                        'Weekly Limit' = 'N/A'
+                        'Weekly Reset' = '-'
+                    }
+                }
+            } catch {
+                Write-Host " Error ($($_.Exception.Message))." -ForegroundColor Red
+                $rows += [PSCustomObject]@{
+                    Active         = if ($isCur) { '*' } else { ' ' }
+                    Profile        = $p.Name
+                    '5h Limit'     = 'Error'
+                    '5h Reset'     = '-'
+                    'Weekly Limit' = 'Error'
+                    'Weekly Reset' = '-'
+                }
+            }
+        }
+    } finally {
+        Restore-OriginalState $origActive $origCred
+    }
+
+    Write-Host "`nGemini Models Quota Status ('*' = active profile, reset times in local time):"
+    $rows | Format-Table -AutoSize
 }
 
 function Invoke-Current {
@@ -601,6 +738,7 @@ Usage:  agy-profile <command> [name] [path] [-Force] [-Password <pwd>]
   next                 Switch to the next profile (round-robin, A-Z order)
   random               Switch to a random profile other than the current one
   list                 List saved profiles
+  quota [name]         Check Gemini model limits (5h & weekly) across profiles
   current              Show which profile is active
   delete <name>        Delete the saved copy of a profile
   export <name> [file] Export a profile to a password-protected .agyprofile file
@@ -621,6 +759,10 @@ First-time setup with 2 accounts:
   agy-profile save work
   agy-profile switch personal    # from now on, switching is one command
 
+Check quota:
+  agy-profile quota              # list Gemini 5h & weekly quota across all profiles
+  agy-profile quota work         # check quota for a specific profile
+
 Move a profile to another machine:
   agy-profile export work work.agyprofile   # prompts for a password
   # copy work.agyprofile to the other machine, then:
@@ -638,6 +780,9 @@ try {
         'next'    { Invoke-Next }
         'random'  { Invoke-Random }
         'list'    { Invoke-List }
+        'quota'   { Invoke-Quota }
+        'usage'   { Invoke-Quota }
+        'limits'  { Invoke-Quota }
         'current' { Invoke-Current }
         'delete'  { Invoke-Delete }
         'export'  { Invoke-Export }
